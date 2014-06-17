@@ -34,6 +34,7 @@
 unsigned arg_files_max = 16*1024;
 off_t arg_file_size_max = READAHEAD_FILE_SIZE_MAX;
 usec_t arg_timeout = 2*USEC_PER_MINUTE;
+FILE *finputlist = NULL;
 
 static int help(void) {
 
@@ -42,7 +43,8 @@ static int help(void) {
                "  -h --help                 Show this help\n"
                "     --max-files=INT        Maximum number of files to read ahead\n"
                "     --file-size-max=BYTES  Maximum size of files to read ahead\n"
-               "     --timeout=USEC         Maximum time to spend collecting data\n\n\n",
+               "     --timeout=USEC         Maximum time to spend collecting data\n"
+               "     --filelist=ABSOLUTE_PATH         Inclusive list of files to be used in creating the pack\n\n\n",
                program_invocation_short_name);
 
         printf("%s [OPTIONS...] replay [DIRECTORY]\n\n"
@@ -64,7 +66,8 @@ static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_FILES_MAX = 0x100,
                 ARG_FILE_SIZE_MAX,
-                ARG_TIMEOUT
+                ARG_TIMEOUT,
+                ARG_FILELIST
         };
 
         static const struct option options[] = {
@@ -72,10 +75,12 @@ static int parse_argv(int argc, char *argv[]) {
                 { "files-max",     required_argument, NULL, ARG_FILES_MAX      },
                 { "file-size-max", required_argument, NULL, ARG_FILE_SIZE_MAX  },
                 { "timeout",       required_argument, NULL, ARG_TIMEOUT        },
+                { "filelist",      required_argument, NULL, ARG_FILELIST       },
                 { NULL,            0,                 NULL, 0                  }
         };
 
-        int c;
+        int c, ret;
+        char filelistname[LINE_MAX];
 
         assert(argc >= 0);
         assert(argv);
@@ -91,7 +96,8 @@ static int parse_argv(int argc, char *argv[]) {
                 case ARG_FILES_MAX:
                         if (safe_atou(optarg, &arg_files_max) < 0 || arg_files_max <= 0) {
                                 log_error("Failed to parse maximum number of files %s.", optarg);
-                                return -EINVAL;
+                                ret = -EINVAL;
+                                goto out;
                         }
                         break;
 
@@ -100,7 +106,8 @@ static int parse_argv(int argc, char *argv[]) {
 
                         if (safe_atollu(optarg, &ull) < 0 || ull <= 0) {
                                 log_error("Failed to parse maximum file size %s.", optarg);
-                                return -EINVAL;
+                                ret = -EINVAL;
+                                goto out;
                         }
 
                         arg_file_size_max = (off_t) ull;
@@ -110,31 +117,56 @@ static int parse_argv(int argc, char *argv[]) {
                 case ARG_TIMEOUT:
                         if (parse_sec(optarg, &arg_timeout) < 0 || arg_timeout <= 0) {
                                 log_error("Failed to parse timeout %s.", optarg);
-                                return -EINVAL;
+                                ret = -EINVAL;
+                                goto out;
                         }
 
                         break;
 
+                case ARG_FILELIST:
+                        if (sscanf(optarg, "%s", filelistname) != 1) {
+                                log_error("Invalid filelistname.\n");
+                                ret = -EINVAL;
+                                /* in unlikely event that two of these switches
+                                   are given on the command line */
+                                goto out;
+                        }
+                        else {
+                                finputlist = fopen(filelistname,"r");
+                                if (!finputlist) {
+                                        log_error("Cannot read list %s of collect-file names.\n", filelistname);
+                                        return -ENOENT;
+                                }
+                                log_info("Using files in %s to generate pack.\n", filelistname);
+                        }
+                        break;
                 case '?':
-                        return -EINVAL;
+                        ret = -EINVAL;
+                        goto out;
 
                 default:
                         log_error("Unknown option code %c", c);
-                        return -EINVAL;
+                        ret = -EINVAL;
+                        goto out;
                 }
         }
 
         if (optind != argc-1 &&
             optind != argc-2) {
                 help();
-                return -EINVAL;
+                ret = -EINVAL;
+                goto out;
         }
 
         return 1;
+out:
+        if (finputlist)
+                fclose(finputlist);
+        return ret;
 }
 
 int main(int argc, char *argv[]) {
-        int r;
+        int ret, r = EXIT_FAILURE;
 
         log_set_target(LOG_TARGET_SAFE);
         log_parse_environment();
@@ -142,17 +174,29 @@ int main(int argc, char *argv[]) {
 
         umask(0022);
 
-        r = parse_argv(argc, argv);
-        if (r <= 0)
-                return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        ret = parse_argv(argc, argv);
+        if (ret == 0)
+                r = EXIT_SUCCESS;
+        if (ret <= 0)
+                goto out;
 
         if (streq(argv[optind], "collect"))
-                return main_collect(argv[optind+1]);
+                /* finputlist is NULL if not --filelist is given */
+                /* disable new features to test input file reading
+                r = main_collect(argv[optind+1], finputlist);
+                */
+                r = main_collect(argv[optind+1]);
         else if (streq(argv[optind], "replay"))
-                return main_replay(argv[optind+1]);
+                r = main_replay(argv[optind+1]);
         else if (streq(argv[optind], "analyze"))
-                return main_analyze(argv[optind+1]);
+                r = main_analyze(argv[optind+1]);
+        else {
+                log_error("Unknown verb %s.", argv[optind]);
+                r = EXIT_FAILURE;
+        }
 
-        log_error("Unknown verb %s.", argv[optind]);
-        return EXIT_FAILURE;
+out:
+        if (finputlist)
+                fclose(finputlist);
+        return r;
 }
