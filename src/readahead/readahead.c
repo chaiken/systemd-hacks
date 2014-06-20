@@ -34,7 +34,7 @@
 unsigned arg_files_max = 16*1024;
 off_t arg_file_size_max = READAHEAD_FILE_SIZE_MAX;
 usec_t arg_timeout = 2*USEC_PER_MINUTE;
-FILE *finputlist = NULL;
+FILE *finputlist;
 
 static int help(void) {
 
@@ -182,10 +182,7 @@ int main(int argc, char *argv[]) {
 
         if (streq(argv[optind], "collect"))
                 /* finputlist is NULL if not --filelist is given */
-                /* disable new features to test input file reading
-                r = main_collect(argv[optind+1], finputlist);
-                */
-                r = main_collect(argv[optind+1]);
+                r = main_collect(argv[optind+1], &finputlist);
         else if (streq(argv[optind], "replay"))
                 r = main_replay(argv[optind+1]);
         else if (streq(argv[optind], "analyze"))

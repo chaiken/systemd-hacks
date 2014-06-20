@@ -56,6 +56,6 @@ int block_bump_request_nr(const char *p);
 int block_get_readahead(const char *p, uint64_t *bytes);
 int block_set_readahead(const char *p, uint64_t bytes);
 
-int main_collect(const char *root);
+int main_collect(const char *root, FILE **finputlist);
 int main_replay(const char *root);
 int main_analyze(const char *pack_path);

@@ -74,6 +74,17 @@ static usec_t starttime;
 #define SECTOR_TO_PTR(s) ULONG_TO_PTR((s)+1)
 #define PTR_TO_SECTOR(p) (PTR_TO_ULONG(p)-1)
 
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#define DEBUG 1
+
+enum {
+         FD_FANOTIFY,  /* Get the actual fs events */
+         FD_SIGNAL,
+         FD_INOTIFY,   /* We get notifications to quit early via this fd */
+         _FD_MAX
+};
+typedef struct pollfd pollfdvec[_FD_MAX];
+
 static int btrfs_defrag(int fd) {
         struct btrfs_ioctl_vol_args data = { .fd = fd };
 
@@ -227,13 +238,212 @@ static int qsort_compare(const void *a, const void *b) {
         return strcmp(i->path, j->path);
 }
 
+struct FileNode {
+        char filename[LINE_MAX];
+        struct FileNode *next;
+};
+
+static int create_FileNode(const char *filep, struct FileNode **nodepp) {
+        *nodepp = (struct FileNode *) malloc(sizeof(struct FileNode));
+
+        if (nodepp == NULL) {
+                log_oom();
+                return -ENOMEM;
+        }
+
+        strncpy((*nodepp)->filename, filep, LINE_MAX);
+        (*nodepp)->next = NULL;
+        return 0;
+}
+
+static void free_nodelist(struct FileNode **fnlist) {
+
+        struct FileNode *head = *fnlist, *save = *fnlist;
+
+        assert(*fnlist);
+
+        /* find tail */
+        while ((*fnlist)->next) {
+                save = *fnlist;
+                (*fnlist) = (*fnlist)->next;
+        }
+
+        /* free head */
+        if (!save->next) {
+                free(save);
+                return;
+        }
+
+        /* free tail */
+        free(save->next);
+        *fnlist = save;
+        (*fnlist)->next = NULL;
+        free_nodelist(&head);
+}
+
+static void add_filenode(struct FileNode *nnode, struct FileNode **listp) {
+
+        assert(nnode);
+
+        /* initiate list */
+        if (*listp == NULL) {
+                *listp = nnode;
+                return;
+        }
+
+        /* find tail */
+        while ((*listp)->next)
+                *listp = (*listp)->next;
+
+        /* add to tail */
+        (*listp)->next = nnode;
+        *listp = nnode;
+        return;
+}
+
+static void show_listed_files(struct FileNode *nodelist, int nodectr)
+{
+        if (!nodelist)
+                return;
+
+        printf("No. %d at %p next %p %s\n", nodectr, nodelist, nodelist->next, nodelist->filename);
+        show_listed_files(nodelist->next, ++nodectr);
+}
+
+static int get_listed_files(FILE **inputlistfile, struct FileNode **ListHead, int *filenum) {
+
+        struct FileNode *filenodelist = NULL, *newnode = NULL;
+        struct stat st;
+        char line[LINE_MAX], listfile[LINE_MAX];
+        int retv = 0;
+        struct rlimit fdmax;
+        fdmax.rlim_cur = 0;
+        *ListHead = NULL;
+
+        assert(*inputlistfile);
+
+        retv = getrlimit(RLIMIT_NOFILE, &fdmax);
+        if (retv < 0) {
+                perror("readahead-cu351ollect: cannot get system limit for file descriptors");
+                return retv;
+        }
+
+        while ((fgets(line, sizeof(line), *inputlistfile)) && ((unsigned) *filenum < fdmax.rlim_cur)) {
+                if (!sscanf(line, "%s", listfile)) {
+                        log_warning("Bad filename %s", listfile);
+                        break;
+                }
+                if (stat(listfile, &st) < 0) {
+                        log_warning("stat(%s) failed: %m", listfile);
+                        break;
+                }
+                if ( ! (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
+                        log_debug("Skipping special file %s", listfile);
+                        break;
+                }
+                if ((S_IRUSR & st.st_mode) == 0) {
+                        log_debug("Input list file %s is not readable", listfile);
+                        break;
+                }
+
+                retv = create_FileNode((const char *) listfile, &newnode);
+                if (retv)
+                        return retv;
+                add_filenode(newnode, &filenodelist);
+                if (*filenum == 0)
+                        *ListHead = filenodelist;
+                (*filenum)++;
+        }
+
+        if (!(*filenum)) {
+                log_error("No readable files in filelist.\n");
+                retv = -EBADF;
+        }
+        else
+                log_debug("Watching %d files\n", *filenum);
+
+        fclose(*inputlistfile);
+        *inputlistfile = NULL;
+        return retv;
+}
+
+static int init_file_list(struct FileNode *headp, int *numfiles) {
+
+        int r = 0, i;
+        int fanotify_fd = -1, signal_fd = -1, inotify_fd = -1;
+        sigset_t mask;
+
+        pollfdvec pollfdarr[*numfiles];
+
+        assert_se(sigemptyset(&mask) == 0);
+        sigset_add_many(&mask, SIGINT, SIGTERM, -1);
+        assert_se(sigprocmask(SIG_SETMASK, &mask, NULL) == 0);
+
+        for (i=0; i < *numfiles; i++) {
+
+                if ((!headp) || (!strlen(headp->filename))) {
+                        log_error("Bad file node number %d\n", i);
+                        r = -EBADF;
+                        goto finish;
+                }
+
+                if ((signal_fd = signalfd(-1, &mask, SFD_NONBLOCK|SFD_CLOEXEC)) < 0) {
+                        log_error("signalfd(): %m");
+                        r = -errno;
+                        goto finish;
+                }
+
+                fanotify_fd = fanotify_init(FAN_CLOEXEC|FAN_NONBLOCK, O_RDONLY|O_LARGEFILE|O_CLOEXEC|O_NOATIME);
+                if (fanotify_fd < 0)  {
+                        log_error("Failed to create fanotify object: %m");
+                        r = -errno;
+                        goto finish;
+                }
+
+                if (fanotify_mark(fanotify_fd, FAN_MARK_ADD|FAN_MARK_MOUNT, FAN_OPEN, AT_FDCWD, headp->filename) < 0) {
+                        log_error("Failed to mark %s: %m", headp->filename);
+                        r = -errno;
+                        goto finish;
+                }
+
+                inotify_fd = open_inotify();
+                if (inotify_fd < 0) {
+                        r = inotify_fd;
+                        goto finish;
+                }
+
+                pollfdarr[i][FD_FANOTIFY].fd = fanotify_fd;
+                pollfdarr[i][FD_FANOTIFY].events = POLLIN;
+                pollfdarr[i][FD_SIGNAL].fd = signal_fd;
+                pollfdarr[i][FD_SIGNAL].events = POLLIN;
+                pollfdarr[i][FD_INOTIFY].fd = inotify_fd;
+                pollfdarr[i][FD_INOTIFY].events = POLLIN;
+
+                headp = headp->next;
+        }
+
+finish:
+        for (i=0; i < *numfiles; i++) {
+
+                fanotify_fd = (pollfdarr[i][FD_FANOTIFY]).fd;
+                signal_fd = (pollfdarr[i][FD_SIGNAL]).fd;
+                inotify_fd = (pollfdarr[i][FD_INOTIFY]).fd;
+
+                if (fanotify_fd >= 0)
+                        close_nointr_nofail(fanotify_fd);
+
+                if (signal_fd >= 0)
+                        close_nointr_nofail(signal_fd);
+
+                if (inotify_fd >= 0)
+                        close_nointr_nofail(inotify_fd);
+        }
+
+        return r;
+}
+
 static int collect(const char *root) {
-        enum {
-                FD_FANOTIFY,  /* Get the actual fs events */
-                FD_SIGNAL,
-                FD_INOTIFY,   /* We get notifications to quit early via this fd */
-                _FD_MAX
-        };
+
         struct pollfd pollfd[_FD_MAX] = {};
         int fanotify_fd = -1, signal_fd = -1, inotify_fd = -1, r = 0;
         pid_t my_pid;
@@ -618,7 +828,12 @@ finish:
         return r;
 }
 
-int main_collect(const char *root) {
+int main_collect(const char *root, FILE **listfilefd) {
+
+        struct FileNode *HEAD;
+        int ret = 0;
+        int *numfiles = (int *) malloc(sizeof(int));
+        *numfiles = 0;
 
         if (!root)
                 root = "/";
@@ -628,25 +843,42 @@ int main_collect(const char *root) {
          * file system on top, since that one is most likely mounted
          * read-only anyway at boot, even if the underlying block
          * device is theoretically writable. */
-        if (fs_on_read_only(root) > 0) {
-                log_info("Disabling readahead collector due to read-only media.");
+	        if (fs_on_read_only(root) > 0) {
+	                log_info("Disabling readahead collector due to read-only media.");
+	                return EXIT_SUCCESS;
+	        }
+
+	        if (!enough_ram()) {
+	                log_info("Disabling readahead collector due to low memory.");
+	                return EXIT_SUCCESS;
+	        }
+
+	        shared = shared_get();
+	        if (!shared)
+	                return EXIT_FAILURE;
+
+	        shared->collect = getpid();
+	        __sync_synchronize();
+
+                if (listfilefd) {
+                        ret = get_listed_files(listfilefd, &HEAD, numfiles);
+                        if ((!ret) && (DEBUG)) {
+                                show_listed_files(HEAD, 0);
+                        }
+
+                        if (!init_file_list(HEAD, numfiles))
+                                free_nodelist(&HEAD);
+                        else goto out;
+                }
+                else if (collect(root) < 0)
+                        goto out;
+
+                free(numfiles);
                 return EXIT_SUCCESS;
-        }
-
-        if (!enough_ram()) {
-                log_info("Disabling readahead collector due to low memory.");
-                return EXIT_SUCCESS;
-        }
-
-        shared = shared_get();
-        if (!shared)
+out:
+                if (numfiles)
+                        free(numfiles);
+                if (HEAD)
+                        free_nodelist(&HEAD);
                 return EXIT_FAILURE;
-
-        shared->collect = getpid();
-        __sync_synchronize();
-
-        if (collect(root) < 0)
-                return EXIT_FAILURE;
-
-        return EXIT_SUCCESS;
 }
