@@ -32,6 +32,8 @@
 
 #include "readahead-common.h"
 
+#define DEBUG 0
+
 int main_analyze(const char *pack_path) {
         char line[LINE_MAX];
         _cleanup_fclose_ FILE *pack = NULL;
@@ -96,9 +98,9 @@ int main_analyze(const char *pack_path) {
                         if ((b == 0) && (c == 0))
                                 break;
 
-                        /* Uncomment this to get all the chunks separately
-                           printf(" %d: %d %d\n", sections, b, c);
-                         */
+                        /* Uncomment this to get all the chunks separately */
+                        if (DEBUG)
+                                printf(" %d: %d %d\n", sections, b, c);
 
                         pages += (c - b);
                         sections++;

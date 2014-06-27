@@ -75,7 +75,7 @@ static usec_t starttime;
 #define PTR_TO_SECTOR(p) (PTR_TO_ULONG(p)-1)
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
-#define DEBUG 1
+#define DEBUG 0
 
 enum {
          FD_FANOTIFY,  /* Get the actual fs events */
@@ -83,7 +83,6 @@ enum {
          FD_INOTIFY,   /* We get notifications to quit early via this fd */
          _FD_MAX
 };
-typedef struct pollfd pollfdvec[_FD_MAX];
 
 static int btrfs_defrag(int fd) {
         struct btrfs_ioctl_vol_args data = { .fd = fd };
@@ -238,15 +237,32 @@ static int qsort_compare(const void *a, const void *b) {
         return strcmp(i->path, j->path);
 }
 
+static int qsort_compare_time(const void *a, const void *b) {
+        const struct item *i, *j;
+
+        i = a;
+        j = b;
+
+        /* sort by bin only */
+        if (i->bin < j->bin)
+                return -1;
+        if (i->bin > j->bin)
+                return 1;
+
+        return strcmp(i->path, j->path);
+}
+
 struct FileNode {
         char filename[LINE_MAX];
         struct FileNode *next;
 };
 
 static int create_FileNode(const char *filep, struct FileNode **nodepp) {
-        *nodepp = (struct FileNode *) malloc(sizeof(struct FileNode));
 
-        if (nodepp == NULL) {
+        *nodepp = NULL;
+        *nodepp = new0(struct FileNode, 1);
+
+        if (!nodepp) {
                 log_oom();
                 return -ENOMEM;
         }
@@ -271,6 +287,7 @@ static void free_nodelist(struct FileNode **fnlist) {
         /* free head */
         if (!save->next) {
                 free(save);
+                *fnlist = NULL;
                 return;
         }
 
@@ -305,7 +322,6 @@ static void show_listed_files(struct FileNode *nodelist, int nodectr)
 {
         if (!nodelist)
                 return;
-
         printf("No. %d at %p next %p %s\n", nodectr, nodelist, nodelist->next, nodelist->filename);
         show_listed_files(nodelist->next, ++nodectr);
 }
@@ -329,21 +345,26 @@ static int get_listed_files(FILE **inputlistfile, struct FileNode **ListHead, in
         }
 
         while ((fgets(line, sizeof(line), *inputlistfile)) && ((unsigned) *filenum < fdmax.rlim_cur)) {
+                listfile[0] = '\0';
                 if (!sscanf(line, "%s", listfile)) {
                         log_warning("Bad filename %s", listfile);
-                        break;
+                        continue;
+                }
+                if (!(strlen(listfile))) {
+                        log_debug("End of input filelist.");
+                        continue;
                 }
                 if (stat(listfile, &st) < 0) {
                         log_warning("stat(%s) failed: %m", listfile);
-                        break;
+                        continue;
                 }
                 if ( ! (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
                         log_debug("Skipping special file %s", listfile);
-                        break;
+                        continue;
                 }
                 if ((S_IRUSR & st.st_mode) == 0) {
                         log_debug("Input list file %s is not readable", listfile);
-                        break;
+                        continue;
                 }
 
                 retv = create_FileNode((const char *) listfile, &newnode);
@@ -367,29 +388,418 @@ static int get_listed_files(FILE **inputlistfile, struct FileNode **ListHead, in
         return retv;
 }
 
-static int init_file_list(struct FileNode *headp, int *numfiles) {
+static int collect_file_list(const char *root, struct pollfd fanfd[], int *filenum) {
 
-        int r = 0, i;
-        int fanotify_fd = -1, signal_fd = -1, inotify_fd = -1;
+        struct pollfd pollfd[_FD_MAX] = {};
+        int signal_fd = -1, inotify_fd = -1, r = 0, ctr;
+        pid_t my_pid;
+        Hashmap *files = NULL;
+        Iterator i;
+        char *p, *q;
         sigset_t mask;
+        FILE *pack = NULL;
+        char *pack_fn_new = NULL, *pack_fn = NULL;
+        bool on_ssd, on_btrfs;
+        struct statfs sfs;
+        usec_t not_after;
+        uint64_t previous_block_readahead;
+        bool previous_block_readahead_set = false;
+        struct item *ordered, *j;
+        unsigned uk, un;
+        usec_t entrytime;
 
-        pollfdvec pollfdarr[*numfiles];
+        assert(root);
+        assert(*filenum);
+
+        if ((asprintf(&pack_fn, "%s/.readahead", root) < 0) || (pollfd == NULL)) {
+                r = log_oom();
+                goto finish;
+        }
+
+        starttime = now(CLOCK_MONOTONIC);
+
+        /* If there's no pack file yet we lower the kernel readahead
+         * so that mincore() is accurate. If there is a pack file
+         * already we assume it is accurate enough so that kernel
+         * readahead is never triggered. */
+        previous_block_readahead_set =
+                access(pack_fn, F_OK) < 0 &&
+                block_get_readahead(root, &previous_block_readahead) >= 0 &&
+                block_set_readahead(root, 8*1024) >= 0;
+
+        if (ioprio_set(IOPRIO_WHO_PROCESS, getpid(), IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0)) < 0)
+                log_warning("Failed to set IDLE IO priority class: %m");
 
         assert_se(sigemptyset(&mask) == 0);
         sigset_add_many(&mask, SIGINT, SIGTERM, -1);
         assert_se(sigprocmask(SIG_SETMASK, &mask, NULL) == 0);
 
-        for (i=0; i < *numfiles; i++) {
+        /* all watched files can share one file descriptor for signals
+           and notifications, which go to the process as a whole */
+        if ((signal_fd = signalfd(-1, &mask, SFD_NONBLOCK|SFD_CLOEXEC)) < 0) {
+                log_error("signalfd(): %m");
+                r = -errno;
+                goto finish;
+        }
 
-                if ((!headp) || (!strlen(headp->filename))) {
-                        log_error("Bad file node number %d\n", i);
-                        r = -EBADF;
+        files = hashmap_new(string_hash_func, string_compare_func);
+        if (!files) {
+                log_error("Failed to allocate set.");
+                r = -ENOMEM;
+                goto finish;
+        }
+
+        inotify_fd = open_inotify();
+        if (inotify_fd < 0) {
+                r = inotify_fd;
+                goto finish;
+        }
+
+        not_after = now(CLOCK_MONOTONIC) + arg_timeout;
+
+        my_pid = getpid();
+
+        pollfd[FD_SIGNAL].fd = signal_fd;
+        pollfd[FD_SIGNAL].events = POLLIN;
+        pollfd[FD_INOTIFY].fd = inotify_fd;
+        pollfd[FD_INOTIFY].events = POLLIN;
+
+        sd_notify(0,
+                "READY=1\n"
+                "STATUS=Collecting readahead data");
+
+        log_debug("Collecting...");
+
+        if (access("/run/systemd/readahead/cancel", F_OK) >= 0) {
+                log_debug("Collection canceled");
+                r = -ECANCELED;
+                goto finish;
+        }
+
+        if (access("/run/systemd/readahead/done", F_OK) >= 0) {
+                log_debug("Got termination request");
+                goto done;
+        }
+
+        for (;;) {
+                union {
+                        struct fanotify_event_metadata metadata;
+                        char buffer[4096];
+                } data;
+                ssize_t n;
+                struct fanotify_event_metadata *m;
+                usec_t t;
+                int h;
+
+                if (hashmap_size(files) > arg_files_max) {
+                        printf("Reached maximum number of read ahead files, ending collection.\n");
+                        break;
+                }
+
+                t = now(CLOCK_MONOTONIC);
+                if (t >= not_after) {
+                        printf("Reached maximum collection time, ending collection for file %d.\n", ctr);
+                        break;
+                }
+
+                /* quickly check for signals or notifications */
+                  not_after = now(CLOCK_MONOTONIC) + 1;
+                /* since fanotify access events are no longer
+                 * in pollfd, do not stop collection for
+                 * timeout (h=0) here */
+                if ((h = poll(pollfd, (_FD_MAX - 1), (int) ((not_after - t) / USEC_PER_MSEC))) < 0) {
+
+                        if (errno == EINTR)
+                                continue;
+
+                        log_error("poll(): %m");
+                        r = -errno;
                         goto finish;
                 }
 
-                if ((signal_fd = signalfd(-1, &mask, SFD_NONBLOCK|SFD_CLOEXEC)) < 0) {
-                        log_error("signalfd(): %m");
+                if (pollfd[FD_SIGNAL].revents) {
+                        log_debug("Got signal.");
+                        break;
+                }
+
+                if (pollfd[FD_INOTIFY].revents) {
+                        uint8_t inotify_buffer[sizeof(struct inotify_event) + FILENAME_MAX];
+                        struct inotify_event *e;
+
+                        if ((n = read(inotify_fd, &inotify_buffer, sizeof(inotify_buffer))) < 0) {
+                                if (errno == EINTR || errno == EAGAIN)
+                                        continue;
+
+                                log_error("Failed to read inotify event: %m");
+                                r = -errno;
+                                goto finish;
+                        }
+
+                        e = (struct inotify_event*) inotify_buffer;
+                        while (n > 0) {
+                                size_t step;
+
+                                if ((e->mask & IN_CREATE) && streq(e->name, "cancel")) {
+                                        log_debug("Collection canceled");
+                                        r = -ECANCELED;
+                                        goto finish;
+                                }
+
+                                if ((e->mask & IN_CREATE) && streq(e->name, "done")) {
+                                        log_debug("Got termination request");
+                                        goto done;
+                                }
+
+                                step = sizeof(struct inotify_event) + e->len;
+                                assert(step <= (size_t) n);
+
+                                e = (struct inotify_event*) ((uint8_t*) e + step);
+                                n -= step;
+                        }
+                }
+
+                /* check for access of all FDs in parallel */
+                not_after = now(CLOCK_MONOTONIC) + arg_timeout;
+                t = now(CLOCK_MONOTONIC);
+                if ((h = poll(fanfd, *filenum, (int) ((not_after - t) / USEC_PER_MSEC))) < 0) {
+
+                        if (errno == EINTR)
+                                continue;
+
+                        log_error("poll(): %m");
                         r = -errno;
+                        goto finish;
+                }
+
+                if (h == 0) {
+                        log_debug("Reached maximum collection time, ending collection.");
+                        break;
+                }
+
+                entrytime = now(CLOCK_MONOTONIC);
+
+                /* tabulate per-file access events */
+                for (ctr = 0; ctr < *filenum; ctr++) {
+
+                        n = read(fanfd[ctr].fd, &data, sizeof(data));
+                        if (n < 0) {
+                                if (errno == EINTR || errno == EAGAIN)
+                                        continue;
+
+                                /* fanotify sometimes returns EACCES on read()
+                                 * where it shouldn't. For now let's just
+                                 * ignore it here (which is safe), but
+                                 * eventually this should be
+                                 * dropped when the kernel is fixed.
+                                 *
+                                 * https://bugzilla.redhat.com/show_bug.cgi?id=707577 */
+                                if (errno == EACCES)
+                                        continue;
+
+                                log_error("Failed to read event: %m");
+                                r = -errno;
+                                goto finish;
+                        }
+
+                        for (m = &data.metadata; FAN_EVENT_OK(m, n); m = FAN_EVENT_NEXT(m, n)) {
+                                char fn[PATH_MAX];
+                                int k;
+
+                                if (m->fd < 0)
+                                        goto next_iteration;
+
+                                if (m->pid == my_pid)
+                                        goto next_iteration;
+
+                                __sync_synchronize();
+                                if (m->pid == shared->replay)
+                                        goto next_iteration;
+
+                                snprintf(fn, sizeof(fn), "/proc/self/fd/%i", m->fd);
+                                char_array_0(fn);
+
+                                /* read file access data from /proc and
+                                   store in hashmap */
+                                if ((k = readlink_malloc(fn, &p)) >= 0) {
+                                        if (startswith(p, "/tmp") ||
+                                                endswith(p, " (deleted)") ||
+                                                hashmap_get(files, p))
+                                                /* Not interesting, or
+                                                 * already read */
+                                                free(p);
+                                        else {
+                                                unsigned long ul;
+                                                struct item *entry;
+
+                                                entry = new0(struct item, 1);
+                                                if (!entry) {
+                                                        r = log_oom();
+                                                        goto finish;
+                                                }
+
+                                                ul = fd_first_block(m->fd);
+
+                                                entrytime = now(CLOCK_MONOTONIC);
+                                                entry->block = ul;
+                                                entry->path = strdup(p);
+                                                if (!entry->path) {
+                                                        free(entry);
+                                                        r = log_oom();
+                                                        goto finish;
+                                                }
+
+                                                entry->bin = (entrytime - starttime) / 2000000;
+                                                k = hashmap_put(files, p, entry);
+                                                if (k < 0) {
+                                                        log_warning("hashmap_put() failed: %s", strerror(-k));
+                                                        free(p);
+                                                }
+                                        }
+
+                                } else
+                                        log_warning("readlink(%s) failed: %s", fn, strerror(-k));
+
+                        next_iteration:
+                                if (m->fd >= 0)
+                                        close_nointr_nofail(m->fd);
+                        }
+                }
+        }
+
+done:
+
+        /* stop watching files */
+        for (ctr = 0; ctr < *filenum; ctr++) {
+                if (fanfd[ctr].fd >= 0) {
+                        close_nointr_nofail(fanfd[ctr].fd);
+                        fanfd[ctr].fd = -1;
+                }
+        }
+
+        log_debug("Writing Pack File...");
+
+        on_ssd = fs_on_ssd(root) > 0;
+        log_debug("On SSD: %s", yes_no(on_ssd));
+
+        on_btrfs = statfs(root, &sfs) >= 0 && F_TYPE_CMP(sfs.f_type, BTRFS_SUPER_MAGIC);
+        log_debug("On btrfs: %s", yes_no(on_btrfs));
+
+        if (asprintf(&pack_fn_new, "%s/.readahead.new", root) < 0) {
+                r = log_oom();
+                goto finish;
+        }
+
+        pack = fopen(pack_fn_new, "we");
+        if (!pack) {
+                log_error("Failed to open pack file: %m");
+                r = -errno;
+                goto finish;
+        }
+
+        fputs(CANONICAL_HOST READAHEAD_PACK_FILE_VERSION, pack);
+        putc(on_ssd ? 'S' : 'R', pack);
+
+        log_debug("Ordering...");
+
+        un = hashmap_size(files);
+        if (!(ordered = new(struct item, un))) {
+                r = log_oom();
+                goto finish;
+        }
+
+        j = ordered;
+        HASHMAP_FOREACH_KEY(q, p, files, i) {
+                memcpy(j, q, sizeof(struct item));
+                j++;
+        }
+
+        assert(ordered + un == j);
+
+        /* On SSD or on btrfs, sort by the order
+         * in which the files were accessed.
+         *  On rotating media, order a second time by the block
+         * numbers */
+        if (on_ssd || on_btrfs)
+                qsort(ordered, un, sizeof(struct item), qsort_compare_time);
+        else
+                qsort(ordered, un, sizeof(struct item), qsort_compare);
+
+        for (uk = 0; uk < un; uk++)
+                pack_file(pack, ordered[uk].path, on_btrfs);
+
+        free(ordered);
+
+        log_debug("Finalizing...");
+
+        fflush(pack);
+
+        if (ferror(pack)) {
+                log_error("Failed to write pack file.");
+                r = -EIO;
+                goto finish;
+        }
+
+        if (rename(pack_fn_new, pack_fn) < 0) {
+                log_error("Failed to rename readahead file: %m");
+                r = -errno;
+                goto finish;
+        }
+
+        fclose(pack);
+        pack = NULL;
+
+        log_debug("Done.");
+
+finish:
+        /* fanotify file descriptors should already be closed */
+        if (pollfd[FD_SIGNAL].fd >= 0) {
+                close_nointr_nofail(pollfd[FD_SIGNAL].fd);
+                pollfd[FD_SIGNAL].fd = -1;
+        }
+        if (pollfd[FD_INOTIFY].fd >= 0) {
+                close_nointr_nofail(pollfd[FD_INOTIFY].fd);
+                pollfd[FD_INOTIFY].fd = -1;
+        }
+
+        if (pack) {
+                fclose(pack);
+                unlink(pack_fn_new);
+        }
+        free(pack_fn_new);
+        free(pack_fn);
+
+        while ((p = hashmap_steal_first_key(files)))
+                free(p);
+
+        hashmap_free(files);
+
+        if (previous_block_readahead_set) {
+                uint64_t bytes;
+
+                /* Restore the original kernel readahead setting if we
+                 * changed it, and nobody has overwritten it since
+                 * yet. */
+                if (block_get_readahead(root, &bytes) >= 0 && bytes == 8*1024)
+                        block_set_readahead(root, previous_block_readahead);
+        }
+
+        return r;
+}
+
+static int process_file_list(struct FileNode **headp, int *numfiles, const char *root) {
+
+        int fanotify_fd = -1, r = 0, i;
+        struct FileNode *savep = *headp;
+        struct pollfd fdvec[*numfiles];
+
+        assert(root);
+        assert(*headp);
+
+        for (i=0; i < *numfiles; i++) {
+
+                if ((!(*headp)) || (!strlen((*headp)->filename))) {
+                        log_error("Bad file node number %d\n", i);
+                        r = -EBADF;
                         goto finish;
                 }
 
@@ -400,50 +810,29 @@ static int init_file_list(struct FileNode *headp, int *numfiles) {
                         goto finish;
                 }
 
-                if (fanotify_mark(fanotify_fd, FAN_MARK_ADD|FAN_MARK_MOUNT, FAN_OPEN, AT_FDCWD, headp->filename) < 0) {
-                        log_error("Failed to mark %s: %m", headp->filename);
+                if (fanotify_mark(fanotify_fd, FAN_MARK_ADD, FAN_ACCESS|FAN_OPEN|FAN_EVENT_ON_CHILD, AT_FDCWD, (*headp)->filename) < 0) {
+                        log_error("Failed to mark %s: %m", (*headp)->filename);
                         r = -errno;
                         goto finish;
                 }
 
-                inotify_fd = open_inotify();
-                if (inotify_fd < 0) {
-                        r = inotify_fd;
-                        goto finish;
-                }
-
-                pollfdarr[i][FD_FANOTIFY].fd = fanotify_fd;
-                pollfdarr[i][FD_FANOTIFY].events = POLLIN;
-                pollfdarr[i][FD_SIGNAL].fd = signal_fd;
-                pollfdarr[i][FD_SIGNAL].events = POLLIN;
-                pollfdarr[i][FD_INOTIFY].fd = inotify_fd;
-                pollfdarr[i][FD_INOTIFY].events = POLLIN;
-
-                headp = headp->next;
+                fdvec[i].fd = fanotify_fd;
+                fdvec[i].events = POLLIN;
+                (*headp) = (*headp)->next;
         }
 
+        r = collect_file_list(root, fdvec, numfiles);
+
 finish:
-        for (i=0; i < *numfiles; i++) {
-
-                fanotify_fd = (pollfdarr[i][FD_FANOTIFY]).fd;
-                signal_fd = (pollfdarr[i][FD_SIGNAL]).fd;
-                inotify_fd = (pollfdarr[i][FD_INOTIFY]).fd;
-
-                if (fanotify_fd >= 0)
-                        close_nointr_nofail(fanotify_fd);
-
-                if (signal_fd >= 0)
-                        close_nointr_nofail(signal_fd);
-
-                if (inotify_fd >= 0)
-                        close_nointr_nofail(inotify_fd);
+        if (savep) {
+                free_nodelist(&savep);
+                savep = NULL;
         }
 
         return r;
 }
 
 static int collect(const char *root) {
-
         struct pollfd pollfd[_FD_MAX] = {};
         int fanotify_fd = -1, signal_fd = -1, inotify_fd = -1, r = 0;
         pid_t my_pid;
@@ -830,10 +1219,8 @@ finish:
 
 int main_collect(const char *root, FILE **listfilefd) {
 
-        struct FileNode *HEAD;
-        int ret = 0;
-        int *numfiles = (int *) malloc(sizeof(int));
-        *numfiles = 0;
+        struct FileNode *HEAD = NULL;
+        int ret = 0, numfiles = 0;
 
         if (!root)
                 root = "/";
@@ -855,29 +1242,28 @@ int main_collect(const char *root, FILE **listfilefd) {
 
 	        shared = shared_get();
 	        if (!shared)
-	                return EXIT_FAILURE;
+                        goto out;
 
 	        shared->collect = getpid();
 	        __sync_synchronize();
 
-                if (listfilefd) {
-                        ret = get_listed_files(listfilefd, &HEAD, numfiles);
+                if (*listfilefd) {
+                        ret = get_listed_files(listfilefd, &HEAD, &numfiles);
                         if ((!ret) && (DEBUG)) {
                                 show_listed_files(HEAD, 0);
                         }
+                        if (ret)
+                                goto out;
 
-                        if (!init_file_list(HEAD, numfiles))
-                                free_nodelist(&HEAD);
-                        else goto out;
+                        ret = process_file_list(&HEAD, &numfiles, root);
+                        if (ret)
+                                goto out;
                 }
                 else if (collect(root) < 0)
                         goto out;
 
-                free(numfiles);
                 return EXIT_SUCCESS;
 out:
-                if (numfiles)
-                        free(numfiles);
                 if (HEAD)
                         free_nodelist(&HEAD);
                 return EXIT_FAILURE;

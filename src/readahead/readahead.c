@@ -160,8 +160,11 @@ static int parse_argv(int argc, char *argv[]) {
 
         return 1;
 out:
-        if (finputlist)
+        if (finputlist) {
                 fclose(finputlist);
+                finputlist = NULL;
+        }
+
         return ret;
 }
 
@@ -173,6 +176,7 @@ int main(int argc, char *argv[]) {
         log_open();
 
         umask(0022);
+        finputlist = NULL;
 
         ret = parse_argv(argc, argv);
         if (ret == 0)
@@ -193,7 +197,10 @@ int main(int argc, char *argv[]) {
         }
 
 out:
-        if (finputlist)
+        if (finputlist) {
                 fclose(finputlist);
+                finputlist = NULL;
+        }
+
         return r;
 }
