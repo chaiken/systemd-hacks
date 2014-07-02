@@ -150,6 +150,16 @@
                                 for the <command>collect</command>
                                 command.</para></listitem>
                         </varlistentry>
+
+                        <varlistentry>
+                                <term><option>--filelist=</option></term>
+
+                                <listitem><para>List of files from which
+                                to create pack. Specifying directories
+                                results in inclusion of their children. Only
+                                valid for the <command>collect</command>
+                                command.</para></listitem>
+                        </varlistentry>
                 </variablelist>
 
         </refsect1>
