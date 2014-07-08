@@ -149,7 +149,13 @@ static int replay(const char *root) {
 
         block_bump_request_nr(root);
 
-        if (asprintf(&pack_fn, "%s/.readahead", root) < 0) {
+        if (strlen(arg_pack_loc)) {
+                if (asprintf(&pack_fn, "%s/.readahead", arg_pack_loc) < 0) {
+                        r = log_oom();
+                        goto finish;
+                }
+        }
+        else if (asprintf(&pack_fn, "%s/.readahead", root) < 0) {
                 r = log_oom();
                 goto finish;
         }
