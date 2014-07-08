@@ -253,7 +253,13 @@ static int collect(const char *root) {
 
         assert(root);
 
-        if (asprintf(&pack_fn, "%s/.readahead", root) < 0) {
+        if (strlen(arg_pack_loc)) {
+                if (asprintf(&pack_fn, "%s/.readahead", arg_pack_loc) < 0) {
+                        r = log_oom();
+                        goto finish;
+                }
+        }
+        else if (asprintf(&pack_fn, "%s/.readahead", root) < 0) {
                 r = log_oom();
                 goto finish;
         }
@@ -507,7 +513,13 @@ done:
         on_btrfs = statfs(root, &sfs) >= 0 && F_TYPE_EQUAL(sfs.f_type, BTRFS_SUPER_MAGIC);
         log_debug("On btrfs: %s", yes_no(on_btrfs));
 
-        if (asprintf(&pack_fn_new, "%s/.readahead.new", root) < 0) {
+        if (strlen(arg_pack_loc)) {
+                if (asprintf(&pack_fn_new, "%s/.readahead.new", arg_pack_loc) < 0) {
+                        r = log_oom();
+                        goto finish;
+                }
+        }
+        else if (asprintf(&pack_fn_new, "%s/.readahead.new", root) < 0) {
                 r = log_oom();
                 goto finish;
         }

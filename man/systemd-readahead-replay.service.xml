@@ -84,7 +84,7 @@
                 to end data collection. On this signal, this service
                 will then sort the collected disk accesses and store
                 information about them in
-                <filename>/.readahead</filename>.</para>
+                <filename>/.readahead</filename> by default.</para>
 
                 <para>Normally, both
                 <filename>systemd-readahead-collect.service</filename>
@@ -142,6 +142,14 @@
                                 to spend collecting data. Only valid
                                 for the <command>collect</command>
                                 command.</para></listitem>
+                        </varlistentry>
+
+                        <varlistentry>
+                                <term><option>--pack-location=</option></term>
+                                <listitem><para>Directory where .readahead
+                                will be created, different from the root
+                                whose accesses are the basis of pack
+                                formation.</para></listitem>
                         </varlistentry>
 
                         <xi:include href="standard-options.xml" xpointer="help" />

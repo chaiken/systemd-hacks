@@ -34,6 +34,7 @@
 extern unsigned arg_files_max;
 extern off_t arg_file_size_max;
 extern usec_t arg_timeout;
+extern char arg_pack_loc[LINE_MAX];
 
 int file_verify(int fd, const char *fn, off_t file_size_max, struct stat *st);
 

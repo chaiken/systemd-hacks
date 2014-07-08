@@ -35,6 +35,7 @@
 unsigned arg_files_max = 16*1024;
 off_t arg_file_size_max = READAHEAD_FILE_SIZE_MAX;
 usec_t arg_timeout = 2*USEC_PER_MINUTE;
+char arg_pack_loc[LINE_MAX];
 
 static int help(void) {
 
@@ -44,14 +45,16 @@ static int help(void) {
                "     --version              Show package version\n"
                "     --files-max=INT        Maximum number of files to read ahead\n"
                "     --file-size-max=BYTES  Maximum size of files to read ahead\n"
-               "     --timeout=USEC         Maximum time to spend collecting data\n\n\n",
+               "     --timeout=USEC         Maximum time to spend collecting data\n"
+               "     --pack-location=DIR    Directory in which to create the pack-file\n\n\n",
                program_invocation_short_name);
 
         printf("%s [OPTIONS...] replay [DIRECTORY]\n\n"
                "Replay collected read-ahead data on early boot.\n\n"
                "  -h --help                 Show this help\n"
                "     --version              Show package version\n"
-               "     --file-size-max=BYTES  Maximum size of files to read ahead\n\n\n",
+               "     --file-size-max=BYTES  Maximum size of files to read ahead\n"
+               "     --pack-location=DIR    Directory from which to read the pack-file\n\n\n",
                program_invocation_short_name);
 
         printf("%s [OPTIONS...] analyze [PACK FILE]\n\n"
@@ -69,7 +72,8 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_VERSION = 0x100,
                 ARG_FILES_MAX,
                 ARG_FILE_SIZE_MAX,
-                ARG_TIMEOUT
+                ARG_TIMEOUT,
+                ARG_PACK_LOC
         };
 
         static const struct option options[] = {
@@ -120,6 +124,14 @@ static int parse_argv(int argc, char *argv[]) {
                 case ARG_TIMEOUT:
                         if (parse_sec(optarg, &arg_timeout) < 0 || arg_timeout <= 0) {
                                 log_error("Failed to parse timeout %s.", optarg);
+                                return -EINVAL;
+                        }
+
+                        break;
+
+                case ARG_PACK_LOC:
+                        if (sscanf(optarg, "%s", arg_pack_loc) != 1) {
+                                log_error("Failed to parse pack location %s.", optarg);
                                 return -EINVAL;
                         }
 
