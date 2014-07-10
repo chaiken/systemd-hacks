@@ -143,6 +143,16 @@
                         </varlistentry>
 
                         <varlistentry>
+                                <term><option>--file-size-min=</option></term>
+
+                                <listitem><para>Minimum size of files
+                                in bytes to read ahead. Only valid
+                                for the <command>collect</command>
+                                and <command>replay</command>
+                                commands.</para></listitem>
+                        </varlistentry>
+
+                        <varlistentry>
                                 <term><option>--timeout=</option></term>
 
                                 <listitem><para>Maximum time in microseconds

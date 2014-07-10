@@ -117,7 +117,7 @@ static int pack_file(FILE *pack, const char *fn, bool on_btrfs) {
                 goto finish;
         }
 
-        k = file_verify(fd, fn, arg_file_size_max, &st);
+        k = file_verify(fd, fn, arg_file_size_max, arg_file_size_min, &st);
         if (k <= 0) {
                 r = k;
                 goto finish;

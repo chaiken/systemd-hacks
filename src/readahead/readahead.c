@@ -33,6 +33,7 @@
 
 unsigned arg_files_max = 16*1024;
 off_t arg_file_size_max = READAHEAD_FILE_SIZE_MAX;
+off_t arg_file_size_min = READAHEAD_FILE_SIZE_MIN;
 usec_t arg_timeout = 2*USEC_PER_MINUTE;
 FILE *finputlist;
 
@@ -43,6 +44,7 @@ static int help(void) {
                "  -h --help                 Show this help\n"
                "     --max-files=INT        Maximum number of files to read ahead\n"
                "     --file-size-max=BYTES  Maximum size of files to read ahead\n"
+               "     --file-size-min=BYTES  Minimum size of files to read ahead\n"
                "     --timeout=USEC         Maximum time to spend collecting data\n"
                "     --filelist=ABSOLUTE_PATH         Inclusive list of files to be used in creating the pack\n\n\n",
                program_invocation_short_name);
@@ -66,6 +68,7 @@ static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_FILES_MAX = 0x100,
                 ARG_FILE_SIZE_MAX,
+                ARG_FILE_SIZE_MIN,
                 ARG_TIMEOUT,
                 ARG_FILELIST
         };
@@ -74,6 +77,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "help",          no_argument,       NULL, 'h'                },
                 { "files-max",     required_argument, NULL, ARG_FILES_MAX      },
                 { "file-size-max", required_argument, NULL, ARG_FILE_SIZE_MAX  },
+                { "file-size-min", required_argument, NULL, ARG_FILE_SIZE_MIN  },
                 { "timeout",       required_argument, NULL, ARG_TIMEOUT        },
                 { "filelist",      required_argument, NULL, ARG_FILELIST       },
                 { NULL,            0,                 NULL, 0                  }
@@ -111,6 +115,19 @@ static int parse_argv(int argc, char *argv[]) {
                         }
 
                         arg_file_size_max = (off_t) ull;
+                        break;
+                }
+
+                case ARG_FILE_SIZE_MIN: {
+                        unsigned long long ull;
+
+                        if (safe_atollu(optarg, &ull) < 0 || ull <= 0) {
+                                log_error("Failed to parse minimum file size %s.", optarg);
+                                ret = -EINVAL;
+                                goto out;
+                        }
+
+                        arg_file_size_min = (off_t) ull;
                         break;
                 }
 

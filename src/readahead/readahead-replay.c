@@ -67,7 +67,7 @@ static int unpack_file(FILE *pack) {
                 if (errno != ENOENT && errno != EPERM && errno != EACCES && errno != ELOOP)
                         log_warning("open(%s) failed: %m", fn);
 
-        } else if (file_verify(fd, fn, arg_file_size_max, &st) <= 0) {
+        } else if (file_verify(fd, fn, arg_file_size_max, arg_file_size_min, &st) <= 0) {
                 close_nointr_nofail(fd);
                 fd = -1;
         }

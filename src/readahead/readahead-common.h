@@ -28,14 +28,16 @@
 #include "util.h"
 
 #define READAHEAD_FILE_SIZE_MAX (10*1024*1024)
+#define READAHEAD_FILE_SIZE_MIN 0
 
 #define READAHEAD_PACK_FILE_VERSION ";VERSION=2\n"
 
 extern unsigned arg_files_max;
 extern off_t arg_file_size_max;
+extern off_t arg_file_size_min;
 extern usec_t arg_timeout;
 
-int file_verify(int fd, const char *fn, off_t file_size_max, struct stat *st);
+int file_verify(int fd, const char *fn, off_t file_size_max, off_t file_size_min, struct stat *st);
 
 int fs_on_ssd(const char *p);
 int fs_on_read_only(const char *p);
