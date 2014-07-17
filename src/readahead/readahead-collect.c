@@ -702,8 +702,14 @@ done:
         log_debug("Ordering...");
 
         un = hashmap_size(files);
-        if (!(ordered = new(struct item, un))) {
-                r = log_oom();
+        if (un) {
+                if (!(ordered = new(struct item, un))) {
+                        r = log_oom();
+                        goto finish;
+                }
+        }
+        else {
+                log_warning("No files in hashmap.");
                 goto finish;
         }
 
